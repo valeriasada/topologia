@@ -1,0 +1,487 @@
+{
+ "cells": [
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "# Baby feeding study \u2014 data exploration & pre-TDA prep\n",
+    "\n",
+    "Companion to `clean_baby_data.py`. Walks through:\n",
+    "\n",
+    "1. Load all 20 patient sheets into one long DataFrame\n",
+    "2. Pre-clean audit (shape, dtypes, unique values, NaN matrix)\n",
+    "3. Apply standardization (times, days, behavioral binaries, valence/arousal)\n",
+    "4. Post-clean missingness audit (column histogram \u2192 pick drop threshold)\n",
+    "5. Segregate into `X_features` / `X_meta` / `X_indicators`\n",
+    "6. Normalize (z-score + min-max, side-by-side)\n",
+    "7. Pre-TDA exploration (distributions, correlations, PCA, UMAP)\n",
+    "8. Save everything to disk\n",
+    "\n",
+    "**Conventions agreed upfront:**\n",
+    "- Unit of observation: one row per `(patient_id, day)`\n",
+    "- Missing/failed values \u2192 `NaN` + parallel `*_was_missing` / `*_fit_failed` indicator columns\n",
+    "- `S\u00ed, poco` \u2192 ordinal `0.5` (No=0, S\u00ed=1)\n",
+    "- `Distribuci\u00f3n videos` metadata used only for QA cross-check, not as a feature\n",
+    "- Column drop threshold by missingness: **0.60** (revisit after seeing the histogram in step 4)\n"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "## 0. Setup"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "metadata": {},
+   "execution_count": null,
+   "outputs": [],
+   "source": [
+    "import sys\n",
+    "from pathlib import Path\n",
+    "\n",
+    "import numpy as np\n",
+    "import pandas as pd\n",
+    "import matplotlib.pyplot as plt\n",
+    "import seaborn as sns\n",
+    "\n",
+    "# Make the cleaning module importable\n",
+    "sys.path.insert(0, str(Path.cwd()))\n",
+    "import clean_baby_data as cbd\n",
+    "\n",
+    "INPUT_PATH = Path(\"/sessions/ecstatic-optimistic-wozniak/mnt/uploads/baby.xlsx\")\n",
+    "OUTPUT_DIR = Path(\"./cleaned\")\n",
+    "OUTPUT_DIR.mkdir(exist_ok=True)\n",
+    "\n",
+    "sns.set_theme(style=\"whitegrid\", context=\"notebook\")\n",
+    "pd.set_option(\"display.max_columns\", 80)\n",
+    "pd.set_option(\"display.width\", 200)\n"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "## 1. Load & concatenate\n",
+    "\n",
+    "Each `ID*` sheet has the same 26-column schema (ID3 has 8 extra cols for a 3rd test event).\n",
+    "The two-row header in the source is collapsed by position into clean snake_case names\n",
+    "(see `STANDARD_COLUMNS` in `clean_baby_data.py`)."
+   ]
+  },
+  {
+   "cell_type": "code",
+   "metadata": {},
+   "execution_count": null,
+   "outputs": [],
+   "source": [
+    "raw = cbd.load_all_patients(INPUT_PATH)\n",
+    "dist = cbd.load_distribucion_videos(INPUT_PATH)\n",
+    "\n",
+    "print(\"Raw concatenated shape:\", raw.shape)\n",
+    "print(\"Patients:\", raw['patient_id'].nunique())\n",
+    "print(\"Days range:\", raw['day'].min(), \"to\", raw['day'].max())\n",
+    "raw.head()\n"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "## 2. Pre-clean audit"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "metadata": {},
+   "execution_count": null,
+   "outputs": [],
+   "source": [
+    "# Dtype audit \u2014 everything is 'object' before cleaning because of mixed string/numeric cells\n",
+    "raw.dtypes.value_counts()\n"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "metadata": {},
+   "execution_count": null,
+   "outputs": [],
+   "source": [
+    "# Sample of unique values per column \u2014 useful for spotting the encoding chaos\n",
+    "for col in cbd.BEHAVIOR_COLS:\n",
+    "    print(f\"{col:>12}  unique:\", sorted({str(x) for x in raw[col].dropna().unique()}))\n"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "metadata": {},
+   "execution_count": null,
+   "outputs": [],
+   "source": [
+    "# A glimpse at the time columns (numbers, time-strings, malformed entries, missing tokens)\n",
+    "for col in cbd.TIME_COLS:\n",
+    "    sample = raw[col].dropna().astype(str).sample(min(8, raw[col].notna().sum()), random_state=0).tolist()\n",
+    "    print(f\"{col:>12}  sample:\", sample)\n"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "metadata": {},
+   "execution_count": null,
+   "outputs": [],
+   "source": [
+    "# Rows per patient (pre-cleaning)\n",
+    "raw.groupby(\"patient_id\").size().sort_index().to_frame(\"n_days\")\n"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "## 3. Standardize"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "metadata": {},
+   "execution_count": null,
+   "outputs": [],
+   "source": [
+    "cleaned = cbd.standardize(raw)\n",
+    "print(\"Cleaned shape:\", cleaned.shape)\n",
+    "print(\"New columns include `_fit_failed` and `_was_missing` indicators:\")\n",
+    "print([c for c in cleaned.columns if c.endswith(('_fit_failed', '_was_missing'))][:10], \"...\")\n",
+    "cleaned.head()\n"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "metadata": {},
+   "execution_count": null,
+   "outputs": [],
+   "source": [
+    "# Sanity check \u2014 behavioral binaries should now be {0, 0.5, 1, NaN}\n",
+    "for col in cbd.BEHAVIOR_COLS:\n",
+    "    print(f\"{col:>12}\", cleaned[col].value_counts(dropna=False).to_dict())\n"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "metadata": {},
+   "execution_count": null,
+   "outputs": [],
+   "source": [
+    "# Sanity check \u2014 time columns should now be numeric seconds\n",
+    "cleaned[list(cbd.TIME_COLS)].describe()\n"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "## 4. Missingness audit (decide the threshold from the data)"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "metadata": {},
+   "execution_count": null,
+   "outputs": [],
+   "source": [
+    "audit_col = cbd.missingness_audit(cleaned)\n",
+    "audit_col\n"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "metadata": {},
+   "execution_count": null,
+   "outputs": [],
+   "source": [
+    "# Histogram of column-missingness \u2014 look for a natural gap before locking the threshold\n",
+    "fig, ax = plt.subplots(figsize=(10, 4))\n",
+    "audit_col[\"pct_missing\"].sort_values().plot(kind=\"barh\", ax=ax)\n",
+    "ax.axvline(0.60, color=\"red\", linestyle=\"--\", label=\"threshold = 0.60\")\n",
+    "ax.set_xlabel(\"% missing\")\n",
+    "ax.set_title(\"Column missingness (post-cleaning)\")\n",
+    "ax.legend()\n",
+    "plt.tight_layout()\n",
+    "plt.show()\n"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "metadata": {},
+   "execution_count": null,
+   "outputs": [],
+   "source": [
+    "# Per-patient completeness \u2014 useful for flagging unreliable patients\n",
+    "audit_pat = cbd.per_patient_audit(cleaned)\n",
+    "audit_pat.sort_values(\"pct_missing_overall\", ascending=False)\n"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "metadata": {},
+   "execution_count": null,
+   "outputs": [],
+   "source": [
+    "# Cross-check our row counts against the Distribuci\u00f3n videos metadata\n",
+    "qa = cbd.qa_against_distribucion(cleaned, dist)\n",
+    "qa.sort_values(\"row_vs_days_diff\", key=abs, ascending=False)\n"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "metadata": {},
+   "execution_count": null,
+   "outputs": [],
+   "source": [
+    "# Visual: NaN heatmap, rows = patient-days, cols = features\n",
+    "feature_cols = [c for c in cleaned.columns\n",
+    "                if c not in (\"patient_id\", \"day_flag\", \"comments\")\n",
+    "                and not c.endswith((\"_was_missing\", \"_fit_failed\"))]\n",
+    "plt.figure(figsize=(12, 6))\n",
+    "sns.heatmap(cleaned[feature_cols].isna(), cbar=False)\n",
+    "plt.title(\"Missingness map: dark = NaN\")\n",
+    "plt.xlabel(\"feature\")\n",
+    "plt.ylabel(\"row index (patient-day)\")\n",
+    "plt.tight_layout()\n",
+    "plt.show()\n"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "**Decision point.** Look at the histogram + heatmap above and pick a threshold.\n",
+    "Default = 0.60. The bar chart should show a natural gap between the ID3-only test-3\n",
+    "columns (~100% missing) and the test-2 columns (~57%). Anything above the threshold\n",
+    "gets dropped from the feature matrix but kept in the indicator matrix."
+   ]
+  },
+  {
+   "cell_type": "code",
+   "metadata": {},
+   "execution_count": null,
+   "outputs": [],
+   "source": [
+    "DROP_THRESHOLD = 0.60  # <- adjust here and re-run from this cell down\n"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "## 5. Segregate into feature / meta / indicator matrices"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "metadata": {},
+   "execution_count": null,
+   "outputs": [],
+   "source": [
+    "splits = cbd.segregate(cleaned, drop_threshold=DROP_THRESHOLD)\n",
+    "\n",
+    "print(\"X_features    :\", splits[\"X_features\"].shape)\n",
+    "print(\"X_meta        :\", splits[\"X_meta\"].shape)\n",
+    "print(\"X_indicators  :\", splits[\"X_indicators\"].shape)\n",
+    "print(\"Dropped columns:\", splits[\"dropped_columns\"])\n"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "metadata": {},
+   "execution_count": null,
+   "outputs": [],
+   "source": [
+    "splits[\"X_features\"].head()\n"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "## 6. Normalize (kept side-by-side, no imputation)"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "metadata": {},
+   "execution_count": null,
+   "outputs": [],
+   "source": [
+    "X_z = cbd.normalize(splits[\"X_features\"], \"zscore\")\n",
+    "X_mm = cbd.normalize(splits[\"X_features\"], \"minmax\")\n",
+    "\n",
+    "print(\"z-scored stats (should center on 0, std ~1):\")\n",
+    "print(X_z.describe().loc[[\"mean\", \"std\"]].T.round(3))\n"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "## 7. Pre-TDA exploration"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "metadata": {},
+   "execution_count": null,
+   "outputs": [],
+   "source": [
+    "# 7a. Distributions\n",
+    "fig, axes = plt.subplots(4, 6, figsize=(18, 10))\n",
+    "for ax, col in zip(axes.flat, splits[\"X_features\"].columns):\n",
+    "    splits[\"X_features\"][col].hist(ax=ax, bins=20)\n",
+    "    ax.set_title(col, fontsize=9)\n",
+    "    ax.tick_params(labelsize=7)\n",
+    "for ax in axes.flat[splits[\"X_features\"].shape[1]:]:\n",
+    "    ax.axis(\"off\")\n",
+    "plt.tight_layout()\n",
+    "plt.show()\n"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "metadata": {},
+   "execution_count": null,
+   "outputs": [],
+   "source": [
+    "# 7b. Correlation matrix (Spearman is robust to the binary + continuous mix)\n",
+    "plt.figure(figsize=(10, 9))\n",
+    "corr = splits[\"X_features\"].corr(method=\"spearman\")\n",
+    "sns.heatmap(corr, cmap=\"RdBu_r\", center=0, vmin=-1, vmax=1, square=True,\n",
+    "            cbar_kws={\"shrink\": 0.7})\n",
+    "plt.title(\"Spearman correlation among features\")\n",
+    "plt.tight_layout()\n",
+    "plt.show()\n"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "metadata": {},
+   "execution_count": null,
+   "outputs": [],
+   "source": [
+    "# 7c. PCA \u2014 quick 2D projection. NaNs need to be filled for PCA; we use per-column median\n",
+    "#     as a non-destructive temporary fill, ONLY for this sanity plot.\n",
+    "from sklearn.decomposition import PCA\n",
+    "\n",
+    "X_for_pca = X_z.fillna(X_z.median(numeric_only=True))\n",
+    "pca = PCA(n_components=2)\n",
+    "coords = pca.fit_transform(X_for_pca)\n",
+    "\n",
+    "fig, ax = plt.subplots(figsize=(9, 7))\n",
+    "sc = ax.scatter(coords[:, 0], coords[:, 1],\n",
+    "                c=splits[\"X_meta\"][\"patient_id\"].astype(\"category\").cat.codes,\n",
+    "                cmap=\"tab20\", alpha=0.7, s=40)\n",
+    "ax.set_xlabel(f\"PC1 ({pca.explained_variance_ratio_[0]:.1%})\")\n",
+    "ax.set_ylabel(f\"PC2 ({pca.explained_variance_ratio_[1]:.1%})\")\n",
+    "ax.set_title(\"PCA \u2014 colored by patient_id\")\n",
+    "plt.tight_layout()\n",
+    "plt.show()\n"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "metadata": {},
+   "execution_count": null,
+   "outputs": [],
+   "source": [
+    "# 7d. UMAP \u2014 non-linear projection, better intuition for TDA-style geometry\n",
+    "try:\n",
+    "    import umap\n",
+    "    reducer = umap.UMAP(n_neighbors=15, min_dist=0.1, random_state=42)\n",
+    "    embedding = reducer.fit_transform(X_for_pca)\n",
+    "    fig, ax = plt.subplots(figsize=(9, 7))\n",
+    "    ax.scatter(embedding[:, 0], embedding[:, 1],\n",
+    "               c=splits[\"X_meta\"][\"patient_id\"].astype(\"category\").cat.codes,\n",
+    "               cmap=\"tab20\", alpha=0.7, s=40)\n",
+    "    ax.set_title(\"UMAP \u2014 colored by patient_id\")\n",
+    "    plt.tight_layout()\n",
+    "    plt.show()\n",
+    "except ImportError:\n",
+    "    print(\"Install umap-learn to enable: pip install umap-learn\")\n"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "metadata": {},
+   "execution_count": null,
+   "outputs": [],
+   "source": [
+    "# 7e. Color UMAP by a behavioral signal (rejects) to see whether topology aligns with behavior\n",
+    "try:\n",
+    "    fig, ax = plt.subplots(figsize=(9, 7))\n",
+    "    rejects = splits[\"X_features\"][\"rejects\"]\n",
+    "    sc = ax.scatter(embedding[:, 0], embedding[:, 1],\n",
+    "                    c=rejects, cmap=\"RdYlGn_r\", alpha=0.8, s=40)\n",
+    "    plt.colorbar(sc, ax=ax, label=\"rejects (0 / 0.5 / 1)\")\n",
+    "    ax.set_title(\"UMAP \u2014 colored by 'rejects' behavior\")\n",
+    "    plt.tight_layout()\n",
+    "    plt.show()\n",
+    "except (NameError, ImportError):\n",
+    "    pass\n"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "## 8. Save outputs"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "metadata": {},
+   "execution_count": null,
+   "outputs": [],
+   "source": [
+    "cleaned.to_csv(OUTPUT_DIR / \"cleaned_long.csv\", index=False)\n",
+    "splits[\"X_features\"].to_csv(OUTPUT_DIR / \"X_features.csv\", index=False)\n",
+    "splits[\"X_indicators\"].to_csv(OUTPUT_DIR / \"X_indicators.csv\", index=False)\n",
+    "splits[\"X_meta\"].to_csv(OUTPUT_DIR / \"X_meta.csv\", index=False)\n",
+    "X_z.to_csv(OUTPUT_DIR / \"X_features_zscore.csv\", index=False)\n",
+    "X_mm.to_csv(OUTPUT_DIR / \"X_features_minmax.csv\", index=False)\n",
+    "\n",
+    "print(f\"Saved {len(list(OUTPUT_DIR.glob('*.csv')))} CSVs to {OUTPUT_DIR.resolve()}\")\n"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "## Next steps for actual TDA\n",
+    "\n",
+    "The output of this notebook is ready to feed into:\n",
+    "\n",
+    "- **`giotto-tda`** / **`scikit-tda`** for persistent homology on `X_features_zscore`\n",
+    "- **`kmapper`** (Mapper algorithm) with `X_features_minmax` and a lens function\n",
+    "  (e.g. PC1, or a behavioral binary)\n",
+    "- **Patient-level trajectories**: group rows by `patient_id`, sort by `day`, and apply\n",
+    "  TDA over time-series embeddings \u2014 the `*_was_missing` indicators are useful auxiliary\n",
+    "  features for this\n",
+    "\n",
+    "The cleaning code is reusable \u2014 if more patient sheets get added later or a column\n",
+    "schema changes, edit `STANDARD_COLUMNS` in `clean_baby_data.py` and re-run."
+   ]
+  }
+ ],
+ "metadata": {
+  "kernelspec": {
+   "display_name": "Python 3",
+   "language": "python",
+   "name": "python3"
+  },
+  "language_info": {
+   "name": "python",
+   "version": "3.x"
+  }
+ },
+ "nbformat": 4,
+ "nbformat_minor": 5
+}
